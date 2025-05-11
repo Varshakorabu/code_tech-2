@@ -1,0 +1,282 @@
+import os
+import re
+import spacy
+import pdfplumber
+import docx
+from flask import Flask, request, jsonify, render_template
+from werkzeug.utils import secure_filename
+from datetime import datetime
+import psycopg2
+from psycopg2.extras import execute_values
+
+# Initialize Flask app
+app = Flask(__name__)
+
+# Configuration
+UPLOAD_FOLDER = 'uploads'
+ALLOWED_EXTENSIONS = {'pdf', 'docx'}
+app.config['UPLOAD_FOLDER'] = UPLOAD_FOLDER
+os.makedirs(UPLOAD_FOLDER, exist_ok=True)
+
+# Load NLP model
+nlp = spacy.load("en_core_web_lg")
+
+# Database configuration (PostgreSQL)
+DB_CONFIG = {
+    'host': 'localhost',
+    'database': 'resume_parser',
+    'user': 'postgres',
+    'password': 'yourpassword',
+    'port': '5432'
+}
+
+# Create database tables if they don't exist
+def init_db():
+    conn = psycopg2.connect(**DB_CONFIG)
+    cursor = conn.cursor()
+    
+    cursor.execute("""
+    CREATE TABLE IF NOT EXISTS candidates (
+        id SERIAL PRIMARY KEY,
+        name VARCHAR(100),
+        email VARCHAR(100),
+        phone VARCHAR(20),
+        skills TEXT[],
+        education TEXT[],
+        experience TEXT[],
+        filename VARCHAR(255),
+        upload_date TIMESTAMP
+    );
+    """)
+    
+    cursor.execute("""
+    CREATE TABLE IF NOT EXISTS extracted_data (
+        id SERIAL PRIMARY KEY,
+        candidate_id INTEGER REFERENCES candidates(id),
+        entity_type VARCHAR(50),
+        entity_value TEXT,
+        confidence FLOAT
+    );
+    """)
+    
+    conn.commit()
+    cursor.close()
+    conn.close()
+
+init_db()
+
+# Helper functions
+def allowed_file(filename):
+    return '.' in filename and \
+           filename.rsplit('.', 1)[1].lower() in ALLOWED_EXTENSIONS
+
+def extract_text_from_pdf(pdf_path):
+    text = ""
+    with pdfplumber.open(pdf_path) as pdf:
+        for page in pdf.pages:
+            text += page.extract_text()
+    return text
+
+def extract_text_from_docx(docx_path):
+    doc = docx.Document(docx_path)
+    return "\n".join([para.text for para in doc.paragraphs])
+
+def extract_entities(text):
+    doc = nlp(text)
+    
+    # Extract entities
+    entities = {
+        'PERSON': [],
+        'EMAIL': [],
+        'PHONE': [],
+        'ORG': [],  # For companies/universities
+        'DATE': [],  # For experience dates
+        'SKILL': []  # Custom entity (needs training in production)
+    }
+    
+    # Extract emails and phones with regex (more reliable than NER)
+    emails = re.findall(r'[\w\.-]+@[\w\.-]+', text)
+    phones = re.findall(r'(\+?\d[\d\s-]{7,}\d)', text)
+    
+    if emails:
+        entities['EMAIL'] = list(set(emails))  # Remove duplicates
+    if phones:
+        entities['PHONE'] = list(set(phones))
+    
+    # Extract other entities using spaCy
+    for ent in doc.ents:
+        if ent.label_ in entities:
+            entities[ent.label_].append(ent.text)
+    
+    # Simple skill extraction (in production, use trained model or skill database)
+    skill_keywords = ['python', 'java', 'sql', 'machine learning', 'flask', 
+                     'django', 'aws', 'docker', 'javascript', 'react']
+    for word in skill_keywords:
+        if word.lower() in text.lower():
+            entities['SKILL'].append(word)
+    
+    return entities
+
+def extract_education(text):
+    # Simple education extraction (improve with regex patterns)
+    education = []
+    education_keywords = ['university', 'college', 'institute', 'school', 'bachelor', 'master', 'phd']
+    
+    lines = text.split('\n')
+    for line in lines:
+        if any(keyword in line.lower() for keyword in education_keywords):
+            education.append(line.strip())
+    
+    return education
+
+def extract_experience(text):
+    # Simple experience extraction (improve with NLP)
+    experience = []
+    exp_keywords = ['experience', 'work history', 'employment']
+    
+    lines = text.split('\n')
+    for i, line in enumerate(lines):
+        if any(keyword in line.lower() for keyword in exp_keywords):
+            # Get next few lines as experience
+            experience.extend([l.strip() for l in lines[i+1:i+10] if l.strip()])
+            break
+    
+    return experience
+
+# API Endpoints
+@app.route('/')
+def index():
+    return render_template('upload.html')  # Create this HTML file for UI
+
+@app.route('/upload', methods=['POST'])
+def upload_file():
+    if 'file' not in request.files:
+        return jsonify({'error': 'No file part'}), 400
+    
+    file = request.files['file']
+    if file.filename == '':
+        return jsonify({'error': 'No selected file'}), 400
+    
+    if file and allowed_file(file.filename):
+        filename = secure_filename(file.filename)
+        filepath = os.path.join(app.config['UPLOAD_FOLDER'], filename)
+        file.save(filepath)
+        
+        # Extract text based on file type
+        if filename.endswith('.pdf'):
+            text = extract_text_from_pdf(filepath)
+        else:
+            text = extract_text_from_docx(filepath)
+        
+        # Process the text
+        entities = extract_entities(text)
+        education = extract_education(text)
+        experience = extract_experience(text)
+        
+        # Store in database
+        conn = psycopg2.connect(**DB_CONFIG)
+        cursor = conn.cursor()
+        
+        try:
+            # Insert candidate
+            cursor.execute("""
+                INSERT INTO candidates (name, email, phone, skills, education, experience, filename, upload_date)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                RETURNING id
+            """, (
+                entities['PERSON'][0] if entities['PERSON'] else 'Unknown',
+                entities['EMAIL'][0] if entities['EMAIL'] else None,
+                entities['PHONE'][0] if entities['PHONE'] else None,
+                entities['SKILL'],
+                education,
+                experience,
+                filename,
+                datetime.now()
+            ))
+            
+            candidate_id = cursor.fetchone()[0]
+            
+            # Insert extracted entities
+            entities_to_insert = []
+            for entity_type, values in entities.items():
+                for value in values:
+                    entities_to_insert.append((
+                        candidate_id,
+                        entity_type,
+                        value,
+                        0.8  # Confidence score (would be from model in production)
+                    ))
+            
+            execute_values(
+                cursor,
+                "INSERT INTO extracted_data (candidate_id, entity_type, entity_value, confidence) VALUES %s",
+                entities_to_insert
+            )
+            
+            conn.commit()
+            
+            return jsonify({
+                'message': 'Resume processed successfully',
+                'candidate_id': candidate_id,
+                'name': entities['PERSON'][0] if entities['PERSON'] else 'Unknown',
+                'skills': entities['SKILL'],
+                'education': education,
+                'experience': experience
+            })
+        
+        except Exception as e:
+            conn.rollback()
+            return jsonify({'error': str(e)}), 500
+        
+        finally:
+            cursor.close()
+            conn.close()
+    
+    return jsonify({'error': 'File type not allowed'}), 400
+
+@app.route('/candidates', methods=['GET'])
+def get_candidates():
+    conn = psycopg2.connect(**DB_CONFIG)
+    cursor = conn.cursor(cursor_factory=psycopg2.extras.DictCursor)
+    
+    try:
+        cursor.execute("SELECT * FROM candidates ORDER BY upload_date DESC")
+        candidates = cursor.fetchall()
+        
+        return jsonify([dict(candidate) for candidate in candidates])
+    
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+    
+    finally:
+        cursor.close()
+        conn.close()
+
+@app.route('/search', methods=['GET'])
+def search_candidates():
+    skill = request.args.get('skill')
+    if not skill:
+        return jsonify({'error': 'Skill parameter is required'}), 400
+    
+    conn = psycopg2.connect(**DB_CONFIG)
+    cursor = conn.cursor(cursor_factory=psycopg2.extras.DictCursor)
+    
+    try:
+        cursor.execute("""
+            SELECT * FROM candidates 
+            WHERE %s = ANY(skills)
+            ORDER BY upload_date DESC
+        """, (skill.lower(),))
+        
+        candidates = cursor.fetchall()
+        return jsonify([dict(candidate) for candidate in candidates])
+    
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+    
+    finally:
+        cursor.close()
+        conn.close()
+
+if __name__ == '__main__':
+    app.run(host='0.0.0.0', port=5000, debug=True)
